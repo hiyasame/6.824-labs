@@ -24,6 +24,26 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+const (
+	REDUCE string = "reduce"
+	MAP    string = "map"
+)
+
+type AskForTaskArgs struct {
+	WorkerId      int
+	LastTaskType  string
+	LastTaskIndex int
+}
+
+type AskForTaskReply struct {
+	// type 任务类型
+	// map or reduce
+	Type         string
+	TaskIndex    int
+	MapNum       int
+	ReduceNum    int
+	MapInputFile string
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
