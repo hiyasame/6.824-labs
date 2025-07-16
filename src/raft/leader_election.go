@@ -43,8 +43,8 @@ type RequestVoteReply struct {
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.acquireLock()
+	defer rf.releaseLock()
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -79,8 +79,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
 }
 
 func (rf *Raft) handleRequestVoteReply(from int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.acquireLock()
+	defer rf.releaseLock()
 
 	// 检查消息是否过时
 	if args.Term < rf.currentTerm {
@@ -93,6 +93,7 @@ func (rf *Raft) handleRequestVoteReply(from int, args *RequestVoteArgs, reply *R
 	}
 	if rf.state == CANDIDATE && rf.currentTerm == args.Term {
 		if reply.VoteGranted {
+			rf.DLog("granted vote from %v", from)
 			rf.votedMe[from] = true
 			if rf.quorumVoted() {
 				rf.moveStateTo(LEADER)
@@ -139,8 +140,8 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.acquireLock()
+	defer rf.releaseLock()
 
 	// 任期小于本节点的不接受
 	if args.Term < rf.currentTerm {
@@ -159,7 +160,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.persist()
 	}
 
-	//DPrintf("[%v]: received heartbeat from %v\n", rf.me, args.LeaderId)
+	//rf.DLog("received heartbeat from %v\n", args.LeaderId)
 	rf.moveStateTo(FOLLOWER)
 
 	if args.PrevLogIndex > rf.lastLogIndex() {
@@ -184,7 +185,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 找到任期的第一条日志
 		conflictIndex := args.PrevLogIndex
 		for conflictIndex > rf.commitIndex &&
-			rf.getLogTerm(conflictIndex-1) == reply.ConflictTerm {
+			rf.getLogTerm(conflictIndex) == reply.ConflictTerm {
 			conflictIndex--
 		}
 		reply.ConflictIndex = conflictIndex
@@ -199,7 +200,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	reply.Term = rf.currentTerm
 	originLog := rf.log
-	rf.log = rf.log[:args.PrevLogIndex]
+	rf.log = rf.log[:rf.realLogIndex(args.PrevLogIndex+1)]
 	// append any new entries not already in the log
 	logs := make([]Log, len(args.Entries))
 	copy(logs, args.Entries)
@@ -224,7 +225,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) handleAppendEntries(from int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
+	rf.acquireLock()
 	if !reply.Success {
 		if reply.Term > rf.currentTerm {
 			rf.moveStateTo(FOLLOWER)
@@ -261,7 +262,7 @@ func (rf *Raft) handleAppendEntries(from int, args *AppendEntriesArgs, reply *Ap
 			rf.advanceCommitIdx()
 		}
 	}
-	rf.mu.Unlock()
+	rf.releaseLock()
 }
 
 // 调用该方法前需要获取锁，以确保锁释放后其他线程能看见修改
@@ -316,12 +317,24 @@ func (rf *Raft) broadcastHeartbeat() {
 		if i == rf.me {
 			continue
 		}
+		if rf.nextIndex[i] <= rf.snapshot.LastIncludedIndex {
+			snap := rf.cloneSnapshot()
+			args := InstallSnapshotArgs{
+				Term:              currentTerm,
+				LeaderId:          rf.me,
+				LastIncludedIndex: snap.LastIncludedIndex,
+				LastIncludedTerm:  snap.LastIncludedTerm,
+				Data:              snap.Data,
+			}
+			go rf.sendInstallSnapshot(i, &args)
+			continue
+		}
 		reply := AppendEntriesReply{}
 		prevLogIndex := rf.nextIndex[i] - 1
-		prevLogTerm := 0
+		prevLogTerm := rf.snapshot.LastIncludedTerm
 		lastLogIndex := rf.lastLogIndex()
-		if prevLogIndex > 0 {
-			prevLogTerm = rf.log[prevLogIndex-1].Term
+		if prevLogIndex > rf.snapshot.LastIncludedIndex {
+			prevLogTerm = rf.log[rf.realLogIndex(prevLogIndex)].Term
 		}
 		args := AppendEntriesArgs{
 			Term:         currentTerm,
@@ -332,7 +345,7 @@ func (rf *Raft) broadcastHeartbeat() {
 		}
 		// 有可以发送的 log 就把 log 带上
 		if lastLogIndex >= rf.nextIndex[i] {
-			args.Entries = rf.log[rf.nextIndex[i]-1:]
+			args.Entries = rf.log[rf.realLogIndex(rf.nextIndex[i]):]
 		} else {
 			args.Entries = make([]Log, 0)
 		}
@@ -344,9 +357,9 @@ func (rf *Raft) broadcastRequestVote() {
 	for i := range rf.peers {
 		if i != rf.me {
 			lastLogIndex := rf.lastLogIndex()
-			lastLogTerm := 0
-			if lastLogIndex > 0 {
-				lastLogTerm = rf.log[lastLogIndex-1].Term
+			lastLogTerm := rf.snapshot.LastIncludedTerm
+			if lastLogIndex > rf.snapshot.LastIncludedIndex {
+				lastLogTerm = rf.log[rf.realLogIndex(lastLogIndex)].Term
 			}
 			args := RequestVoteArgs{
 				Term:        rf.currentTerm,
@@ -367,7 +380,7 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 
 		// 这里需要插一个 barrier 不然看不见最新的 lastHeartbeat
-		rf.mu.Lock()
+		rf.acquireLock()
 
 		switch rf.state {
 		case FOLLOWER:
@@ -386,7 +399,7 @@ func (rf *Raft) ticker() {
 			rf.broadcastHeartbeat()
 		}
 
-		rf.mu.Unlock()
+		rf.releaseLock()
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.

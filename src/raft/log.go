@@ -11,34 +11,35 @@ type Log struct {
 	Command interface{}
 }
 
-func (rf *Raft) firstLogIndex() int {
-	if len(rf.log) == 0 {
-		return 0
-	}
-	return rf.log[0].Index
-}
-
 func (rf *Raft) lastLogIndex() int {
 	// 0 是 dummy index，代表没有 log
 	// 从 1 开始记
 	if len(rf.log) == 0 {
-		return 0
+		return rf.snapshot.LastIncludedIndex
 	}
 	return rf.log[len(rf.log)-1].Index
 }
 
 func (rf *Raft) lastLogTerm() int {
 	if len(rf.log) == 0 {
-		return 0
+		return rf.snapshot.LastIncludedTerm
 	}
 	return rf.log[len(rf.log)-1].Term
 }
 
-func (rf *Raft) getLogTerm(index int) int {
-	if index == 0 {
-		return 0
+func (rf *Raft) realLogIndex(index int) int {
+
+	if index < rf.snapshot.LastIncludedIndex {
+		return -1
 	}
-	return rf.log[index-1].Term
+	return index - rf.snapshot.LastIncludedIndex - 1
+}
+
+func (rf *Raft) getLogTerm(index int) int {
+	if index <= 0 {
+		return rf.snapshot.LastIncludedTerm
+	}
+	return rf.log[rf.realLogIndex(index)].Term
 }
 
 func (rf *Raft) findLastLogInTerm(term int) int {
@@ -51,6 +52,41 @@ func (rf *Raft) findLastLogInTerm(term int) int {
 		}
 	}
 	return -1
+}
+
+func (rf *Raft) findLogPositionByIndex(index int) int {
+	for i := 0; i < len(rf.log); i++ {
+		if rf.log[i].Index == index {
+			return i
+		}
+		if i+1 < len(rf.log) && rf.log[i].Index < index && rf.log[i+1].Index > index {
+			return i
+		}
+	}
+	return len(rf.log) - 1
+}
+
+func (rf *Raft) compactToSnapshot() {
+	if rf.snapshot.LastIncludedIndex == 0 {
+		return
+	}
+	idx := rf.findLogPositionByIndex(rf.snapshot.LastIncludedIndex)
+	rf.log = rf.log[idx+1:]
+	rf.DLog("log changed(compaction)(snapshot index: %v): %v\n", rf.snapshot.LastIncludedIndex, rf.log)
+	if rf.commitIndex < rf.snapshot.LastIncludedIndex {
+		rf.commitIndex = rf.snapshot.LastIncludedIndex
+	}
+	if rf.lastApplied < rf.snapshot.LastIncludedIndex {
+		rf.lastApplied = rf.snapshot.LastIncludedIndex
+	}
+}
+
+func (rf *Raft) cloneSnapshot() Snapshot {
+	// 论文中提到如果 snapshot 很大的话可以做 copy on write
+	// 不过这里是简化实现，Data 很小
+	snap := Snapshot{LastIncludedIndex: rf.snapshot.LastIncludedIndex, LastIncludedTerm: rf.snapshot.LastIncludedTerm, Data: make([]byte, len(rf.snapshot.Data))}
+	copy(snap.Data, rf.snapshot.Data)
+	return snap
 }
 
 func (rf *Raft) advanceCommitIdx() {
@@ -68,25 +104,43 @@ func (rf *Raft) advanceCommitIdx() {
 }
 
 func (rf *Raft) logMatched(index int, term int) bool {
-	return index <= rf.lastLogIndex() && (index == 0 || term == rf.log[index-1].Term)
+	return index <= rf.lastLogIndex() && (index <= rf.snapshot.LastIncludedIndex || term == rf.log[rf.realLogIndex(index)].Term)
 }
 
 func (rf *Raft) applier() {
+	lastSnapshotIndex := 0
 	for !rf.killed() {
-		rf.mu.Lock()
+		select {
+		case snap := <-rf.snapshotCh:
+			// 只 apply 更新的，忽略掉旧的
+			if snap.LastIncludedIndex > lastSnapshotIndex {
+				rf.acquireLock()
+				rf.DLog("apply snapshot (index %v, term: %v, data: %v)\n", snap.LastIncludedIndex, snap.LastIncludedTerm, snap.Data)
+				rf.releaseLock()
+				rf.applyCh <- ApplyMsg{SnapshotValid: true, SnapshotIndex: snap.LastIncludedIndex, SnapshotTerm: snap.LastIncludedTerm, Snapshot: snap.Data}
+				lastSnapshotIndex = snap.LastIncludedIndex
+			}
+		default:
+		}
+		rf.acquireLock()
 		for rf.commitIndex > rf.lastApplied {
 			// 这里是先 increment 再 apply
 			rf.lastApplied++
-			entry := rf.log[rf.lastApplied-1]
+			entry := rf.log[rf.realLogIndex(rf.lastApplied)]
 			rf.DLog("apply log (index %v) in term %v\n", entry.Index, rf.currentTerm)
+
+			rf.releaseLock()
 
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: entry.Index,
 			}
+
+			rf.acquireLock()
+
 		}
-		rf.mu.Unlock()
+		rf.releaseLock()
 
 		time.Sleep(100 * time.Millisecond)
 	}

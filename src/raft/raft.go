@@ -61,12 +61,17 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// debug fields
+	lockingGoroutineId uint64
+
 	// states not mentioned in paper
 	state           State
 	electionTimeout time.Duration
 	lastHeartBeat   time.Time
 	applyCh         chan ApplyMsg
 	votedMe         []bool
+	snapshot        Snapshot
+	snapshotCh      chan Snapshot
 
 	// persist state on all
 	currentTerm int
@@ -85,8 +90,8 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.acquireLock()
+	defer rf.releaseLock()
 
 	var term int
 	var isleader bool
@@ -117,12 +122,14 @@ func (rf *Raft) persist() {
 	err := e.Encode(rf.currentTerm)
 	err = e.Encode(rf.votedFor)
 	err = e.Encode(rf.log)
+	err = e.Encode(rf.snapshot.LastIncludedIndex)
+	err = e.Encode(rf.snapshot.LastIncludedTerm)
 	if err != nil {
 		panic(err)
 	}
-	rf.DLog("persist (currentTerm: %v, votedFor: %v, log: %v)\n", rf.currentTerm, rf.votedFor, rf.log)
+	rf.DLog("persist (currentTerm: %v, votedFor: %v, log: %v, snapshot: %v)\n", rf.currentTerm, rf.votedFor, rf.log, rf.snapshot)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.snapshot.Data)
 }
 
 // restore previously persisted state.
@@ -149,25 +156,28 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []Log
+	snapshot := Snapshot{}
 	err := d.Decode(&currentTerm)
 	err = d.Decode(&votedFor)
 	err = d.Decode(&log)
+	err = d.Decode(&snapshot.LastIncludedIndex)
+	err = d.Decode(&snapshot.LastIncludedTerm)
+	snapshot.Data = rf.persister.ReadSnapshot()
 	if err != nil {
 		return
 	}
-	rf.DLog("read persist (currentTerm: %v, votedFor: %v, log: %v)\n", currentTerm, votedFor, log)
+	rf.DLog("read persist (currentTerm: %v, votedFor: %v, log: %v, snapshot: %v)\n", currentTerm, votedFor, log, snapshot)
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = log
-}
+	rf.snapshot = snapshot
 
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
-
+	if rf.commitIndex < snapshot.LastIncludedIndex {
+		rf.commitIndex = snapshot.LastIncludedIndex
+	}
+	if rf.lastApplied < snapshot.LastIncludedIndex {
+		rf.lastApplied = snapshot.LastIncludedIndex
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -184,8 +194,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.acquireLock()
+	defer rf.releaseLock()
 
 	index := rf.lastLogIndex() + 1
 	term := rf.currentTerm
@@ -246,14 +256,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf := &Raft{}
 	rf.mu = sync.Mutex{}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.acquireLock()
+	defer rf.releaseLock()
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 	rf.applyCh = applyCh
 	rf.log = make([]Log, 0)
 	rf.votedMe = make([]bool, len(rf.peers))
+	rf.snapshot = Snapshot{
+		LastIncludedIndex: 0,
+		LastIncludedTerm:  0,
+		Data:              make([]byte, 0),
+	}
+	rf.snapshotCh = make(chan Snapshot)
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.state = FOLLOWER
