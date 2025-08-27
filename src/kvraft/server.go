@@ -18,11 +18,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClerkId int64
+	OpId    int
+	OpType  string // "Get", "Put", "Append", "NoOp".
+	Key     string
+	Value   string
 }
 
 type KVServer struct {
@@ -35,19 +39,41 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
+	db map[string]string
 
+	waiters map[int]*sync.Cond
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	op := Op{ClerkId: args.ClerkId, OpType: "Get", Key: args.Key}
+
+	kv.rf.Start(op)
+
+	if kv.waiters[op.OpId] != nil {
+		log.Fatalf("waiter for OpId %d is exist", op.OpId)
+	}
+
+	kv.waiters[op.OpId] = sync.NewCond(&kv.mu)
+
+	// 等待到 get 操作被同步到大部分 raft 节点上
+	kv.waiters[op.OpId].Wait()
+
+	kv.waiters[op.OpId] = nil
+
+	reply.Value = kv.db[args.Key]
 }
 
-func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 
-func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := Op{ClerkId: args.ClerkId, OpType: args.OpType, Key: args.Key, Value: args.Value}
+	kv.rf.Start(op)
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -67,6 +93,40 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) executor() {
+	for msg := range kv.applyCh {
+		if kv.killed() {
+			break
+		}
+
+		kv.mu.Lock()
+
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			switch op.OpType {
+			case "Put":
+				kv.db[op.Key] = op.Value
+				break
+			case "Append":
+				kv.db[op.Key] += op.Value
+				break
+			case "Get":
+				// 通知 waiter
+				cond := kv.waiters[op.OpId]
+				if cond != nil {
+					cond.Signal()
+				}
+
+				// do nothing
+			default:
+				log.Fatalf("Unknown operation type: %s", op.OpType)
+			}
+		}
+
+		kv.mu.Unlock()
+	}
 }
 
 // servers[] contains the ports of the set of
@@ -96,6 +156,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.db = make(map[string]string)
+	kv.waiters = make(map[int]*sync.Cond)
+
+	go kv.executor()
 
 	return kv
 }
