@@ -1,12 +1,14 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -41,7 +43,12 @@ type KVServer struct {
 	// Your definitions here.
 	db map[string]string
 
-	waiters map[int]*sync.Cond
+	// 使用 (ClerkId, OpId) 作为 key 来避免冲突
+	waiters map[string]*sync.Cond
+	// 记录已经处理过的操作，避免重复执行
+	lastApplied map[int64]int // ClerkId -> last applied OpId
+	// 记录当前的 term，用于检测 leader 变更
+	currentTerm int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -49,22 +56,37 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := Op{ClerkId: args.ClerkId, OpType: "Get", Key: args.Key}
-
-	kv.rf.Start(op)
-
-	if kv.waiters[op.OpId] != nil {
-		log.Fatalf("waiter for OpId %d is exist", op.OpId)
+	// 检查是否是重复操作
+	if lastOpId, exists := kv.lastApplied[args.ClerkId]; exists && args.OpId <= lastOpId {
+		reply.Value = kv.db[args.Key]
+		reply.Err = OK
+		return
 	}
 
-	kv.waiters[op.OpId] = sync.NewCond(&kv.mu)
+	op := Op{ClerkId: args.ClerkId, OpType: "Get", Key: args.Key, OpId: args.OpId}
+
+	_, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// 使用复合 key 避免冲突
+	waitKey := fmt.Sprintf("%d-%d", args.ClerkId, args.OpId)
+	if kv.waiters[waitKey] != nil {
+		log.Fatalf("waiter for key %s already exists", waitKey)
+	}
+
+	kv.waiters[waitKey] = sync.NewCond(&kv.mu)
 
 	// 等待到 get 操作被同步到大部分 raft 节点上
-	kv.waiters[op.OpId].Wait()
+	kv.waiters[waitKey].Wait()
 
-	kv.waiters[op.OpId] = nil
+	delete(kv.waiters, waitKey)
 
 	reply.Value = kv.db[args.Key]
+	reply.Err = OK
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -72,8 +94,41 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := Op{ClerkId: args.ClerkId, OpType: args.OpType, Key: args.Key, Value: args.Value}
-	kv.rf.Start(op)
+	// 检查是否是重复操作
+	if lastOpId, exists := kv.lastApplied[args.ClerkId]; exists && args.OpId <= lastOpId {
+		reply.Err = OK
+		return
+	}
+
+	op := Op{ClerkId: args.ClerkId, OpType: args.OpType, Key: args.Key, Value: args.Value, OpId: args.OpId}
+	_, term, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// 使用复合 key 避免冲突
+	waitKey := fmt.Sprintf("%d-%d", args.ClerkId, args.OpId)
+	if kv.waiters[waitKey] != nil {
+		log.Fatalf("waiter for key %s already exists", waitKey)
+	}
+
+	kv.waiters[waitKey] = sync.NewCond(&kv.mu)
+
+	// 等待 op 被同步到大部分 raft 节点上
+	kv.waiters[waitKey].Wait()
+
+	delete(kv.waiters, waitKey)
+
+	// 检查当前的 term 是否发生了变化，如果变化了说明可能发生了 leader 变更
+	currentTerm, stillLeader := kv.rf.GetState()
+	if !stillLeader || currentTerm != term {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	reply.Err = OK
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -103,25 +158,50 @@ func (kv *KVServer) executor() {
 
 		kv.mu.Lock()
 
+		// 检查 term 是否发生了变化
+		currentTerm, _ := kv.rf.GetState()
+		if currentTerm > kv.currentTerm {
+			// Term 发生了变化，清理所有等待的操作
+			for _, cond := range kv.waiters {
+				cond.Signal()
+			}
+			kv.waiters = make(map[string]*sync.Cond)
+			kv.currentTerm = currentTerm
+		}
+
 		if msg.CommandValid {
 			op := msg.Command.(Op)
+
+			// 检查是否是重复操作
+			if lastOpId, exists := kv.lastApplied[op.ClerkId]; exists && op.OpId <= lastOpId {
+				// 重复操作，直接通知等待者但不执行操作
+				waitKey := fmt.Sprintf("%d-%d", op.ClerkId, op.OpId)
+				if cond := kv.waiters[waitKey]; cond != nil {
+					cond.Signal()
+				}
+				kv.mu.Unlock()
+				continue
+			}
+
+			// 执行操作
 			switch op.OpType {
 			case "Put":
 				kv.db[op.Key] = op.Value
-				break
 			case "Append":
 				kv.db[op.Key] += op.Value
-				break
 			case "Get":
-				// 通知 waiter
-				cond := kv.waiters[op.OpId]
-				if cond != nil {
-					cond.Signal()
-				}
-
 				// do nothing
 			default:
 				log.Fatalf("Unknown operation type: %s", op.OpType)
+			}
+
+			// 更新已应用的操作ID
+			kv.lastApplied[op.ClerkId] = op.OpId
+
+			// 通知 waiter
+			waitKey := fmt.Sprintf("%d-%d", op.ClerkId, op.OpId)
+			if cond := kv.waiters[waitKey]; cond != nil {
+				cond.Signal()
 			}
 		}
 
@@ -157,7 +237,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.db = make(map[string]string)
-	kv.waiters = make(map[int]*sync.Cond)
+	kv.waiters = make(map[string]*sync.Cond)
+	kv.lastApplied = make(map[int64]int)
 
 	go kv.executor()
 

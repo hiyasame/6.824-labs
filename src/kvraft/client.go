@@ -1,8 +1,9 @@
 package kvraft
 
 import (
-	"6.5840/labrpc"
 	"time"
+
+	"6.5840/labrpc"
 )
 import "crypto/rand"
 import "math/big"
@@ -28,6 +29,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clerkId = nrand()
 	ck.nextOpId = 0
 	ck.leader = 0
 	return ck
