@@ -215,6 +215,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = Min(args.LeaderCommit, rf.lastLogIndex())
 		rf.DLog("commit index from leader -> %v\n", rf.commitIndex)
+		rf.applyCond.Signal()
 	}
 }
 
@@ -403,8 +404,8 @@ func (rf *Raft) ticker() {
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		// 10s 一次 heartbeat，得随机
-		ms := 50 + (rand.Int63() % 50)
+		// 50-100ms 一次 heartbeat，得随机
+		ms := 20 + (rand.Int63() % 20)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }

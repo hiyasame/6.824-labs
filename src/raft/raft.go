@@ -18,13 +18,12 @@ package raft
 //
 
 import (
-	"6.5840/labgob"
 	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -81,6 +80,7 @@ type Raft struct {
 	// volatile state on all
 	commitIndex int
 	lastApplied int
+	applyCond   *sync.Cond
 
 	// volatile state on leader
 	nextIndex  []int
@@ -178,6 +178,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if rf.lastApplied < snapshot.LastIncludedIndex {
 		rf.lastApplied = snapshot.LastIncludedIndex
 	}
+	rf.applyCond.Signal()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -280,6 +281,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 

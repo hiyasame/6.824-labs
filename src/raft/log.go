@@ -2,7 +2,6 @@ package raft
 
 import (
 	"sort"
-	"time"
 )
 
 type Log struct {
@@ -79,6 +78,7 @@ func (rf *Raft) compactToSnapshot() {
 	if rf.lastApplied < rf.snapshot.LastIncludedIndex {
 		rf.lastApplied = rf.snapshot.LastIncludedIndex
 	}
+	rf.applyCond.Signal()
 }
 
 func (rf *Raft) cloneSnapshot() Snapshot {
@@ -100,6 +100,7 @@ func (rf *Raft) advanceCommitIdx() {
 	if newCommitIndex > rf.commitIndex {
 		rf.DLog("commitIndex -> %v\n", newCommitIndex)
 		rf.commitIndex = newCommitIndex
+		rf.applyCond.Signal()
 	}
 }
 
@@ -140,8 +141,8 @@ func (rf *Raft) applier() {
 			rf.acquireLock()
 
 		}
-		rf.releaseLock()
+		rf.applyCond.Wait()
 
-		time.Sleep(100 * time.Millisecond)
+		rf.releaseLock()
 	}
 }

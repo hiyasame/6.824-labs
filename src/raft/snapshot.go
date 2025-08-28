@@ -77,6 +77,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	snap := rf.cloneSnapshot()
 	rf.releaseLock()
+	go func() {
+		rf.acquireLock()
+		rf.applyCond.Signal()
+		rf.releaseLock()
+	}()
 	rf.snapshotCh <- snap
 }
 
