@@ -1,10 +1,12 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -44,26 +46,25 @@ type KVServer struct {
 	db map[string]string
 
 	// 使用 (ClerkId, OpId) 作为 key 来避免冲突
-	waiters map[string]*sync.Cond
+	waiters map[string]chan Op
 	// 记录已经处理过的操作，避免重复执行
-	lastApplied map[int64]int // ClerkId -> last applied OpId
-	// 记录当前的 term，用于检测 leader 变更
-	currentTerm int
+	lastApplied      map[int64]int // ClerkId -> last applied OpId
+	persister        *raft.Persister
+	lastAppliedIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{ClerkId: args.ClerkId, OpType: "Get", Key: args.Key, OpId: args.OpId}
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	// 检查是否是重复操作
 	if lastOpId, exists := kv.lastApplied[args.ClerkId]; exists && args.OpId <= lastOpId {
 		reply.Value = kv.db[args.Key]
 		reply.Err = OK
+		kv.mu.Unlock()
 		return
 	}
-
-	op := Op{ClerkId: args.ClerkId, OpType: "Get", Key: args.Key, OpId: args.OpId}
+	kv.mu.Unlock()
 
 	_, _, isLeader := kv.rf.Start(op)
 
@@ -74,34 +75,45 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	// 使用复合 key 避免冲突
 	waitKey := fmt.Sprintf("%d-%d", args.ClerkId, args.OpId)
-	if kv.waiters[waitKey] != nil {
-		log.Fatalf("waiter for key %s already exists", waitKey)
+	kv.mu.Lock()
+	if _, ok := kv.waiters[waitKey]; !ok {
+		kv.waiters[waitKey] = make(chan Op, 1)
+	}
+	ch := kv.waiters[waitKey]
+	kv.mu.Unlock()
+
+	select {
+	case appliedOp := <-ch:
+		if appliedOp.ClerkId == op.ClerkId && appliedOp.OpId == op.OpId {
+			kv.mu.Lock()
+			reply.Value = kv.db[op.Key]
+			reply.Err = OK
+			kv.mu.Unlock()
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = ErrWrongLeader
 	}
 
-	kv.waiters[waitKey] = sync.NewCond(&kv.mu)
-
-	// 等待到 get 操作被同步到大部分 raft 节点上
-	kv.waiters[waitKey].Wait()
-
+	kv.mu.Lock()
 	delete(kv.waiters, waitKey)
-
-	reply.Value = kv.db[args.Key]
-	reply.Err = OK
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{ClerkId: args.ClerkId, OpType: args.OpType, Key: args.Key, Value: args.Value, OpId: args.OpId}
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	// 检查是否是重复操作
 	if lastOpId, exists := kv.lastApplied[args.ClerkId]; exists && args.OpId <= lastOpId {
 		reply.Err = OK
+		kv.mu.Unlock()
 		return
 	}
+	kv.mu.Unlock()
 
-	op := Op{ClerkId: args.ClerkId, OpType: args.OpType, Key: args.Key, Value: args.Value, OpId: args.OpId}
-	_, term, isLeader := kv.rf.Start(op)
+	_, _, isLeader := kv.rf.Start(op)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -110,25 +122,27 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	// 使用复合 key 避免冲突
 	waitKey := fmt.Sprintf("%d-%d", args.ClerkId, args.OpId)
-	if kv.waiters[waitKey] != nil {
-		log.Fatalf("waiter for key %s already exists", waitKey)
+	kv.mu.Lock()
+	if _, ok := kv.waiters[waitKey]; !ok {
+		kv.waiters[waitKey] = make(chan Op, 1)
 	}
+	ch := kv.waiters[waitKey]
+	kv.mu.Unlock()
 
-	kv.waiters[waitKey] = sync.NewCond(&kv.mu)
-
-	// 等待 op 被同步到大部分 raft 节点上
-	kv.waiters[waitKey].Wait()
-
-	delete(kv.waiters, waitKey)
-
-	// 检查当前的 term 是否发生了变化，如果变化了说明可能发生了 leader 变更
-	currentTerm, stillLeader := kv.rf.GetState()
-	if !stillLeader || currentTerm != term {
+	select {
+	case appliedOp := <-ch:
+		if appliedOp.ClerkId == op.ClerkId && appliedOp.OpId == op.OpId {
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrWrongLeader
-		return
 	}
 
-	reply.Err = OK
+	kv.mu.Lock()
+	delete(kv.waiters, waitKey)
+	kv.mu.Unlock()
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -158,54 +172,80 @@ func (kv *KVServer) executor() {
 
 		kv.mu.Lock()
 
-		// 检查 term 是否发生了变化
-		currentTerm, _ := kv.rf.GetState()
-		if currentTerm > kv.currentTerm {
-			// Term 发生了变化，清理所有等待的操作
-			for _, cond := range kv.waiters {
-				cond.Signal()
-			}
-			kv.waiters = make(map[string]*sync.Cond)
-			kv.currentTerm = currentTerm
-		}
-
 		if msg.CommandValid {
 			op := msg.Command.(Op)
-
 			// 检查是否是重复操作
-			if lastOpId, exists := kv.lastApplied[op.ClerkId]; exists && op.OpId <= lastOpId {
-				// 重复操作，直接通知等待者但不执行操作
-				waitKey := fmt.Sprintf("%d-%d", op.ClerkId, op.OpId)
-				if cond := kv.waiters[waitKey]; cond != nil {
-					cond.Signal()
+			if lastOpId, exists := kv.lastApplied[op.ClerkId]; !exists || op.OpId > lastOpId {
+				// 执行操作
+				switch op.OpType {
+				case "Put":
+					kv.db[op.Key] = op.Value
+				case "Append":
+					kv.db[op.Key] += op.Value
+				case "Get":
+					// do nothing
+				default:
+					log.Fatalf("Unknown operation type: %s", op.OpType)
 				}
-				kv.mu.Unlock()
-				continue
+				// 更新已应用的操作ID
+				kv.lastApplied[op.ClerkId] = op.OpId
 			}
-
-			// 执行操作
-			switch op.OpType {
-			case "Put":
-				kv.db[op.Key] = op.Value
-			case "Append":
-				kv.db[op.Key] += op.Value
-			case "Get":
-				// do nothing
-			default:
-				log.Fatalf("Unknown operation type: %s", op.OpType)
-			}
-
-			// 更新已应用的操作ID
-			kv.lastApplied[op.ClerkId] = op.OpId
 
 			// 通知 waiter
 			waitKey := fmt.Sprintf("%d-%d", op.ClerkId, op.OpId)
-			if cond := kv.waiters[waitKey]; cond != nil {
-				cond.Signal()
+			if ch, ok := kv.waiters[waitKey]; ok {
+				select {
+				case <-ch: // drain the channel
+				default:
+				}
+				ch <- op
+			}
+
+			if kv.persister.RaftStateSize() > kv.maxraftstate {
+				kv.checkpoint(msg.CommandIndex)
+			}
+		}
+
+		if msg.SnapshotValid {
+			r := bytes.NewBuffer(msg.Snapshot)
+			d := labgob.NewDecoder(r)
+
+			if d.Decode(&kv.db) != nil || d.Decode(&kv.lastApplied) != nil {
+				log.Fatalf("Invalid snapshot: %s", msg.Snapshot)
 			}
 		}
 
 		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) makeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.db) != nil || e.Encode(kv.lastApplied) != nil {
+		panic("failed to encode some fields")
+	}
+	return w.Bytes()
+}
+
+func (kv *KVServer) checkpoint(index int) {
+	snapshot := kv.makeSnapshot()
+	kv.rf.Snapshot(index, snapshot)
+}
+
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var db map[string]string
+	var lastApplied map[int64]int
+	if d.Decode(&db) != nil || d.Decode(&lastApplied) != nil {
+		log.Fatalf("failed to decode snapshot")
+	} else {
+		kv.db = db
+		kv.lastApplied = lastApplied
 	}
 }
 
@@ -234,11 +274,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.db = make(map[string]string)
-	kv.waiters = make(map[string]*sync.Cond)
+	kv.waiters = make(map[string]chan Op)
 	kv.lastApplied = make(map[int64]int)
+	kv.lastAppliedIndex = 0
+
+	kv.readSnapshot(persister.ReadSnapshot())
 
 	go kv.executor()
 

@@ -42,7 +42,7 @@ func (rf *Raft) getLogTerm(index int) int {
 }
 
 func (rf *Raft) findLastLogInTerm(term int) int {
-	for i := rf.lastLogIndex(); i > 0; i-- {
+	for i := rf.lastLogIndex(); i > rf.snapshot.LastIncludedIndex; i-- {
 		if rf.getLogTerm(i) == term {
 			return i
 		}

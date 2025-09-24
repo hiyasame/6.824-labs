@@ -163,6 +163,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//rf.DLog("received heartbeat from %v\n", args.LeaderId)
 	rf.moveStateTo(FOLLOWER)
 
+	if args.PrevLogIndex < rf.snapshot.LastIncludedIndex {
+		reply.Term, reply.Success = rf.currentTerm, false
+		reply.Reason = LogNotMatch
+		reply.ConflictIndex = rf.snapshot.LastIncludedIndex + 1
+		return
+	}
+
 	if args.PrevLogIndex > rf.lastLogIndex() {
 		rf.DLog("prevLogIndex(%v) > lastLogIndex(%v)\n", args.PrevLogIndex, rf.lastLogIndex())
 		reply.Term, reply.Success = rf.currentTerm, false
