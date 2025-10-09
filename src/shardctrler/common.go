@@ -88,7 +88,7 @@ type QueryReply struct {
 
 func (sc *ShardCtrler) DLog(format string, args ...interface{}) {
 	if LogEnable {
-		newFormat := fmt.Sprintf("[ShardCtrler %v]: %s", sc.me, format)
+		newFormat := fmt.Sprintf("[ShardCtrler %v]: %s\n", sc.me, format)
 		fmt.Printf(newFormat, args...)
 	}
 }
