@@ -38,6 +38,15 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	clerkId  int64 // the unique id of this clerk.
+	nextOpId int   // the next op id to allocate for an op.
+	leader   int   // known leader, defaults to the servers[0].
+}
+
+func (ck *Clerk) allocateOpId() int {
+	opId := ck.nextOpId
+	ck.nextOpId++
+	return opId
 }
 
 // the tester calls MakeClerk.
@@ -52,6 +61,9 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.clerkId = nrand()
+	ck.nextOpId = 0
+	ck.leader = 0
 	return ck
 }
 
@@ -60,8 +72,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	args := GetArgs{ClerkId: ck.clerkId, OpId: ck.allocateOpId(), Key: key}
 
 	for {
 		shard := key2shard(key)
@@ -92,11 +103,7 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
+	args := PutAppendArgs{ClerkId: ck.clerkId, OpId: ck.allocateOpId(), OpType: op, Key: key, Value: value}
 
 	for {
 		shard := key2shard(key)
